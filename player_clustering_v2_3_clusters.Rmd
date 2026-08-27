@@ -1,0 +1,214 @@
+---
+title: "MLB Player Cluster Analysis v2"
+author: "Jordan Harris"
+date: "2026-08-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+
+# Set the graphical theme
+ggplot2::theme_set(ggplot2::theme_light())
+
+
+pacman::p_load(
+  dplyr,
+  cluster,
+  factoextra,
+  ggplot2,
+  knitr
+)
+
+```
+
+
+## Purpose
+
+While looking for new project ideas, I came across [this post](https://www.reddit.com/r/Sabermetrics/comments/1mob27g/finding_mlb_batter_types_using_kmeans_clustering/) which got me thinking. How should we categorize players? What factors set players apart from others aside from AVG and OPS? I decided to investigate these questions a little further by focusing on different areas than the redditor. Instead of analyzing expected stats, I chose to use actuals to avoid mischaracterizing a player due to preseason projections and instead of using percentiles from BaseballSavant I decided to use the raw stats. Additionally, my analysis looks at players through mutliple seasons in an attempt to see if a players "style" changes throughout their career (Spoiler: some do!). 
+
+## Data
+
+We use two files from the Lahman baseball database:
+
+- **Batting.csv** — season-level batting counting stats by player
+- **People.csv** — player biographical info, used here only for `nameFirst`/`nameLast`
+
+```{r load-data}
+batting <- read.csv("files/Batting.csv", stringsAsFactors = FALSE)
+
+# People.csv contains some non-UTF8 bytes in accented names (e.g. "Acuna"),
+# so we read it with a fallback encoding to avoid parse errors.
+people <- read.csv("files/People.csv", stringsAsFactors = FALSE, fileEncoding = "latin1") %>%
+  select(playerID, nameFirst, nameLast) %>%
+  mutate(playerName = paste(nameFirst, nameLast))
+```
+
+### Data manipulation
+
+We cluster on single-season stats rather than career totals, this is to see if players evolve throughout their careers. We also restrict to **2000-2023** (the "modern era") and require at least 300 AB in a season, to avoid noisy, small-sample seasons.
+
+```{r build-season-stats}
+season <- batting %>%
+  filter(yearID >= 2000, yearID <= 2023) %>%
+  group_by(playerID, yearID) %>%
+  summarise(
+    AB = sum(AB), H = sum(H),
+    X2B = sum(X2B), X3B = sum(X3B), HR = sum(HR),
+    BB = sum(BB), SO = sum(SO), HBP = sum(HBP), SF = sum(SF),
+    SB = sum(SB), CS = sum(CS),
+    .groups = "drop"
+  ) %>%
+  filter(AB >= 300) %>%
+  mutate(
+    PA      = AB + BB + HBP + SF,
+    singles = H - X2B - X3B - HR,
+    AVG     = H / AB,
+    OBP     = (H + BB + HBP) / PA,
+    SLG     = (singles + 2*X2B + 3*X3B + 4*HR) / AB,
+    ISO     = SLG - AVG,
+    BB_pct  = BB / PA,
+    K_pct   = SO / PA,
+    SB_rate = SB / PA                # speed/aggressiveness proxy
+  )
+
+cat("Qualified player-seasons (2000-2023, AB >= 300):", nrow(season))
+```
+
+## Feature Selection
+
+We deliberately cluster on **rate stats**, not counting stats. Clustering on
+raw HR or SB totals would mostly separate players by playing time (even with min 300 PA, there will discrepancies between starters and other role players), not by style. AVG, OBP, ISO, BB%, K%, and SB rate describe how a player produces
+value offensively, independent of how many plate appearances they got.
+
+```{r features}
+features <- season %>% select(AVG, OBP, ISO, BB_pct, K_pct, SB_rate)
+X <- scale(features)   # standardization is essential for k-means
+```
+
+## 3. Choosing K
+
+We evaluate cluster quality across a range of `k` using the elbow method
+(within-cluster sum of squares)
+
+```{r choose-k}
+set.seed(42)
+
+k_range <- 2:8
+wss <- numeric(length(k_range))
+
+for (i in seq_along(k_range)) {
+  km_i <- kmeans(X, centers = k_range[i], nstart = 25)
+  wss[i] <- km_i$tot.withinss
+}
+
+k_results <- data.frame(k = k_range, wss = wss)
+
+ggplot(k_results, aes(k, wss)) +
+  geom_line() + geom_point(size = 2) +
+  labs(title = "Elbow Method", x = "Number of clusters (k)",
+       y = "Total within-cluster sum of squares") +
+  theme_minimal()
+
+
+```
+
+The elbow bends meaningfully around **k=5**, which also produces clusters with
+clear, interpretable baseball meaning. We proceed with k=5.
+
+## 4. K-Means Clustering
+
+```{r kmeans}
+k <- 3
+km <- kmeans(X, centers = k, nstart = 25)
+season$cluster <- factor(km$cluster)
+
+# Attach player names for readability
+season <- season %>% left_join(people, by = "playerID")
+```
+
+### Cluster profiles
+
+```{r cluster-profiles}
+centroids <- season %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    AVG = round(mean(AVG), 3),
+    OBP = round(mean(OBP), 3),
+    ISO = round(mean(ISO), 3),
+    BB_pct = round(mean(BB_pct), 3),
+    K_pct = round(mean(K_pct), 3),
+    SB_rate = round(mean(SB_rate), 3)
+  ) %>%
+  arrange(cluster)
+
+kable(centroids, caption = "Cluster centroids (mean rate stats by cluster)")
+```
+
+Based on these centroids, the three clusters map onto recognizable hitter
+archetypes:
+
+| Cluster profile | Archetype |
+|---|---|
+| 1. High AVG/OBP/ISO, high BB% | **Power hitters** |
+| 2. High AVG, moderate power, low K% | **All Around Hitters** |
+| 3. Below-average AVG/OBP, low power | **Contact Speedsters** |
+
+### Example players per cluster (2023 season)
+
+```{r example-players}
+season %>%
+  filter(yearID == 2023) %>%
+  group_by(cluster) %>%
+  slice_head(n = 6) %>%
+  select(cluster, playerName, AVG, OBP, ISO, K_pct, SB_rate) %>%
+  arrange(cluster) %>%
+  kable(caption = "Sample 2023 players by cluster")
+```
+
+## Visualizing the Clusters
+
+We use PCA to project the 6-dimensional feature space down to 2D for
+visualization.
+
+```{r pca-plot}
+pca <- prcomp(X)
+season$PC1 <- pca$x[,1]
+season$PC2 <- pca$x[,2]
+
+ggplot(season, aes(PC1, PC2, color = cluster)) +
+  geom_point(alpha = 0.5) +
+  labs(
+    title = "MLB Hitter Archetypes (2000-2023, AB >= 300)",
+    subtitle = "K-means clustering on AVG, OBP, ISO, BB%, K%, SB rate",
+    x = "PC1", y = "PC2"
+  ) +
+  theme_minimal()
+```
+
+## Player Lookups
+
+A useful application of this clustering is tracking how a specific player's
+archetype has shifted over their career — for example, young speed-first
+players often add power as they mature and "graduate" into the elite
+all-around cluster.
+
+```{r player-lookup-function}
+lookup_player <- function(name) {
+  season %>%
+    filter(grepl(name, playerName, ignore.case = TRUE)) %>%
+    select(playerName, yearID, AVG, OBP, ISO, K_pct, SB_rate, cluster) %>%
+    arrange(yearID)
+}
+
+lookup_player("Buxton") %>% kable()
+```
+
+```{r player-lookup-example-2}
+lookup_player("Betts") %>% kable()
+```
