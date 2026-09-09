@@ -1,5 +1,5 @@
 ---
-title: "MLB Player Cluster Analysis v2"
+title: "MLB Player Cluster Analysis v3"
 author: "Jordan Harris"
 date: "2026-08-24"
 output: html_document
